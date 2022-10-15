@@ -7,11 +7,11 @@
 #       extension: .jl
 #       format_name: light
 #       format_version: '1.5'
-#       jupytext_version: 1.13.0
+#       jupytext_version: 1.11.3
 #   kernelspec:
-#     display_name: Julia 1.8.2
+#     display_name: Julia 1.8 (4 threads)
 #     language: julia
-#     name: julia-1.8
+#     name: julia-1.8-multithread
 # ---
 
 # # Quantum gates with "shaped controls"
@@ -58,40 +58,9 @@ using QuantumControl
 # ## Shaped Control Amplitudes Implementation
 
 # +
-import QuantumPropagators
+import QuantumPropagators.Generators:
+    substitute_controls, getcontrols, evalcontrols, getcontrolderiv
 
-
-"""Time-dependent Hamiltonian with non-trivial control amplitudes.
-
-```julia
-Ĥ = Hamiltonian(Ĥ₀, control_terms...)
-```
-
-instantiates a time-dependent Hamiltonian from the static drift ``Ĥ₀`` and
-an arbitrary number of control terms, where each control term is a tuple
-`(Ĥₗ, aₗ)` of a control operator ``Ĥₗ`` and a control amplitude ``aₗ``.
-
-Remember the [Glossary](
-https://juliaquantumcontrol.github.io/QuantumControl.jl/dev/glossary/):
-control amplitudes ``aₗ(ϵₗ(t))`` contain control functions ("controls")
-``ϵₗ(t)``.
-"""
-struct Hamiltonian{OT,CAT}
-    drift::OT
-    control_operators::Vector{OT}
-    control_amplitudes::Vector{CAT}
-    function Hamiltonian(drift, control_terms...)
-        @assert length(control_terms) > 1
-        OT = typeof(drift)
-        CAT = typeof(control_terms[1][2])
-        M = length(control_terms)
-        new{OT,CAT}(
-            drift,
-            [control_terms[i][1] for i = 1:M],
-            [control_terms[i][2] for i = 1:M]
-        )
-    end
-end
 
 """Control amplitude ``aₗ(ϵₗ(t)) = S(t) ϵ(t)``."""
 struct ShapedControlAmplitude
@@ -99,39 +68,20 @@ struct ShapedControlAmplitude
     shape  # S(t)
 end
 
+"""Amplitude S(t) that is not a control."""
+struct StaticShapeAmplitude
+    shape
+end
+
 
 # for plotting
 (Ω::ShapedControlAmplitude)(t::Float64) = Ω.control(t) * Ω.shape(t)
 
 
-function QuantumPropagators.Controls.substitute_controls(
-    generator::Hamiltonian{<:Any,ShapedControlAmplitude},
-    controls_map
-)
-    new_control_terms = [
-        (Ĥₗ, ShapedControlAmplitude(get(controls_map, Ω.control, Ω.control), Ω.shape))
-        for (Ĥₗ, Ω) in zip(generator.control_operators, generator.control_amplitudes)
-    ]
-    return Hamiltonian(generator.drift, new_control_terms...)
-end
+substitute_controls(ampl::ShapedControlAmplitude, controls_map) =
+    ShapedControlAmplitude(get(controls_map, ampl.control, ampl.control), ampl.shape)
 
-
-function QuantumPropagators.Controls.getcontrols(
-    generator::Hamiltonian{<:Any,ShapedControlAmplitude}
-)
-    return [Ω.control for Ω in generator.control_amplitudes]
-end
-
-
-function QuantumPropagators.Controls.evalcontrols(
-    generator::Hamiltonian{<:Any,ShapedControlAmplitude},
-    vals_dict::AbstractDict,
-    tlist::Vector{Float64},
-    n::Int64
-)
-    G = copy(generator.drift)
-    return QuantumPropagators.Controls.evalcontrols!(G, generator, vals_dict, tlist, n)
-end
+getcontrols(ampl::ShapedControlAmplitude) = (ampl.control,)
 
 
 # Midpoint of n'th interval of tlist, but snap to beginning/end (that's
@@ -151,52 +101,13 @@ function _t(tlist, n)
 end
 
 
-function QuantumPropagators.Controls.evalcontrols!(
-    G::OT,
-    generator::Hamiltonian{OT,ShapedControlAmplitude},
-    vals_dict::AbstractDict,
-    tlist::Vector{Float64},
-    n::Int64
-) where {OT}
-    copyto!(G, generator.drift)
-    for (Ĥₗ, Ω) in zip(generator.control_operators, generator.control_amplitudes)
-        val = vals_dict[Ω.control] * Ω.shape(_t(tlist, n))
-        axpy!(val, Ĥₗ, G)
-    end
-    return G
-end
+evalcontrols(ampl::ShapedControlAmplitude, vals_dict, tlist, n) =
+    ampl.shape(_t(tlist, n)) * vals_dict[ampl.control]
 
+evalcontrols(ampl::StaticShapeAmplitude, vals_dict, tlist, n) = ampl.shape(_t(tlist, n))
 
-function QuantumPropagators.Controls.getcontrolderiv(
-    generator::Hamiltonian{<:Any,ShapedControlAmplitude},
-    control
-)
-    for (Ĥₗ, Ω) in zip(generator.control_operators, generator.control_amplitudes)
-        if Ω.control ≡ control
-            return (v, tlist, n) -> (Ω.shape(_t(tlist, n)) * Ĥₗ)
-            # TODO: this can be made more efficient by returning a
-            # ScaledOperator and implementing matrix-vector multiplication for
-            # it.
-        end
-    end
-    return nothing
-end
-
-
-import QuantumControlBase
-using SparseArrays
-
-
-function QuantumControlBase.dynamical_generator_adjoint(
-    G::Hamiltonian{<:Any,ShapedControlAmplitude}
-)
-    Ĥ₀ = copy(adjoint(G.drift))
-    control_terms = [
-        (copy(adjoint(Ĥₗ)), Ω) for
-        (Ĥₗ, Ω) in zip(G.control_operators, G.control_amplitudes)
-    ]
-    return Hamiltonian(Ĥ₀, control_terms...)
-end
+getcontrolderiv(ampl::ShapedControlAmplitude, control) =
+    (control ≡ ampl.control) ? StaticShapeAmplitude(ampl.shape) : 0.0
 # -
 
 # ## Hamiltonian and guess pulses
@@ -220,7 +131,7 @@ const N = 6  # levels per transmon
 using LinearAlgebra
 using SparseArrays
 
-function hamiltonian(;
+function tm_hamiltonian(;
     Ωre,
     Ωim,
     N=N,  # levels per transmon
@@ -260,9 +171,9 @@ function hamiltonian(;
     Ĥ₁im = (𝕚 / 2) * (b̂₁⁺ - b̂₁ + λ * b̂₂⁺ - λ * b̂₂)
 
     if ((N < 5) && (use_sparse ≢ true)) || use_sparse ≡ false
-        H = Hamiltonian(Array(Ĥ₀), (Array(Ĥ₁re), Ωre), (Array(Ĥ₁im), Ωim))
+        H = hamiltonian(Array(Ĥ₀), (Array(Ĥ₁re), Ωre), (Array(Ĥ₁im), Ωim))
     else
-        H = Hamiltonian(Ĥ₀, (Ĥ₁re, Ωre), (Ĥ₁im, Ωim))
+        H = hamiltonian(Ĥ₀, (Ĥ₁re, Ωre), (Ĥ₁im, Ωim))
     end
     return H
 
@@ -277,7 +188,6 @@ end;
 # field exactly at the frequency of the rotating frame.
 
 # +
-# XXX
 using QuantumControl.Shapes: flattop
 
 function guess_pulses(; T=400ns, E₀=35MHz, dt=0.1ns, t_rise=15ns)
@@ -338,11 +248,9 @@ plot_complex_pulse(tlist, Ωre_guess.(tlist) + 𝕚 * Ωim_guess.(tlist))
 
 # We now instantiate the Hamiltonian with these control fields:
 
-H = hamiltonian(Ωre=Ωre_guess, Ωim=Ωim_guess);
+H = tm_hamiltonian(Ωre=Ωre_guess, Ωim=Ωim_guess);
 
 typeof(H)
-
-typeof(QuantumControlBase.dynamical_generator_adjoint(H))
 
 # ## Logical basis for two-qubit gates
 
@@ -442,11 +350,10 @@ problem = ControlProblem(
     use_threads=true,
 );
 
-opt_result, file = @optimize_or_load(
-    datadir(),
+opt_result = @optimize_or_load(
+    datadir("GATE_OCT_shaped.jld2"),
     problem;
     method=:GRAPE,
-    filename="GATE_OCT_shaped.jld2",
     force=true
 );
 
